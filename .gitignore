@@ -13,6 +13,7 @@
 
 # Python/Flask
 server/__pycache__/
+server/app/__pycache__/
 server/*.pyc
 server/*.pyo
 server/*.pyd
@@ -71,3 +72,9 @@ htmlcov/
 # Build artifacts
 build/
 dist/
+
+# Virtual environment
+brm_venv/
+
+# Sample Data
+SampleAgreements/

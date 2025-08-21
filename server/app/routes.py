@@ -14,6 +14,73 @@ ALLOWED_EXTENSIONS = {'pdf'}
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
+def calculate_important_dates(agreement):
+    """Calculate important dates based on agreement terms"""
+    important_dates = []
+    
+    if not agreement.end_date:
+        return important_dates
+    
+    # Always add expiration date
+    important_dates.append({
+        'type': 'expiration_date',
+        'date': agreement.end_date,
+        'description': f'{agreement.vendor} agreement expires',
+        'is_recurring': False,
+        'recurrence_interval_months': None
+    })
+    
+    # Add renewal date (typically same as expiration for non-auto-renewing)
+    important_dates.append({
+        'type': 'renewal_date', 
+        'date': agreement.end_date,
+        'description': f'{agreement.vendor} agreement renewal due',
+        'is_recurring': True,
+        'recurrence_interval_months': agreement.term_length_months or 12
+    })
+    
+    # Calculate notice deadline (assume 90 days before expiration if not specified)
+    notice_days = 90  # Default notice period
+    notice_date = agreement.end_date - timedelta(days=notice_days)
+    
+    # Only add notice deadline if it's in the future relative to effective date
+    if not agreement.effective_date or notice_date > agreement.effective_date:
+        important_dates.append({
+            'type': 'notice_deadline',
+            'date': notice_date,
+            'description': f'{agreement.vendor} renewal notice deadline ({notice_days} days before expiration)',
+            'is_recurring': False,
+            'recurrence_interval_months': None
+        })
+    
+    return important_dates
+
+def update_agreement_dates(agreement):
+    """Update calendar events for an agreement"""
+    try:
+        # Delete existing dates for this agreement
+        AgreementDate.query.filter_by(agreement_id=agreement.id).delete()
+        
+        # Calculate new important dates
+        important_dates = calculate_important_dates(agreement)
+        
+        # Add new dates
+        for date_info in important_dates:
+            agreement_date = AgreementDate(
+                agreement_id=agreement.id,
+                date_type=date_info['type'],
+                date_value=date_info['date'],
+                description=date_info['description'],
+                is_recurring=date_info['is_recurring'],
+                recurrence_interval_months=date_info['recurrence_interval_months']
+            )
+            db.session.add(agreement_date)
+        
+        return True
+    except Exception as e:
+        current_app.logger.error(f"Error updating agreement dates: {str(e)}")
+        return False
+
 @bp.route('/health', methods=['GET'])
 def health_check():
     return jsonify({'status': 'healthy', 'timestamp': datetime.utcnow().isoformat()})
@@ -59,17 +126,23 @@ def upload_pdf():
         db.session.add(agreement)
         db.session.flush()  # Get the ID
         
-        # Add extracted dates
-        for date_info in extracted_data.get('important_dates', []):
-            agreement_date = AgreementDate(
-                agreement_id=agreement.id,
-                date_type=date_info['type'],
-                date_value=date_info['date'],
-                description=date_info.get('description'),
-                is_recurring=date_info.get('is_recurring', False),
-                recurrence_interval_months=date_info.get('recurrence_interval_months')
-            )
-            db.session.add(agreement_date)
+        # Add extracted dates (prefer AI-extracted dates if available)
+        ai_dates = extracted_data.get('important_dates', [])
+        if ai_dates:
+            # Use AI-extracted dates
+            for date_info in ai_dates:
+                agreement_date = AgreementDate(
+                    agreement_id=agreement.id,
+                    date_type=date_info['type'],
+                    date_value=date_info['date'],
+                    description=date_info.get('description'),
+                    is_recurring=date_info.get('is_recurring', False),
+                    recurrence_interval_months=date_info.get('recurrence_interval_months')
+                )
+                db.session.add(agreement_date)
+        else:
+            # Fallback to calculated dates
+            update_agreement_dates(agreement)
         
         db.session.commit()
         
@@ -161,3 +234,123 @@ def get_upcoming_dates():
     except Exception as e:
         current_app.logger.error(f"Upcoming dates error: {str(e)}")
         return jsonify({'error': 'Failed to fetch upcoming dates'}), 500
+
+@bp.route('/agreements/<agreement_id>', methods=['DELETE'])
+def delete_agreement(agreement_id):
+    """Delete an agreement and all its associated data"""
+    try:
+        # Find the agreement
+        agreement = Agreement.query.get(agreement_id)
+        if not agreement:
+            return jsonify({'error': 'Agreement not found'}), 404
+        
+        # Store vendor name for response
+        vendor_name = agreement.vendor
+        
+        # Delete the agreement (cascading deletes will handle related data)
+        db.session.delete(agreement)
+        db.session.commit()
+        
+        return jsonify({
+            'message': f'Successfully deleted {vendor_name} agreement',
+            'deleted_id': agreement_id
+        }), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Delete agreement error: {str(e)}")
+        return jsonify({'error': 'Failed to delete agreement'}), 500
+
+@bp.route('/agreements/<agreement_id>', methods=['PUT'])
+def update_agreement(agreement_id):
+    """Update an agreement's details and sync calendar events"""
+    try:
+        # Find the agreement
+        agreement = Agreement.query.get(agreement_id)
+        if not agreement:
+            return jsonify({'error': 'Agreement not found'}), 404
+        
+        # Get the JSON data from request
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+        
+        # Track if date-related fields changed
+        dates_changed = False
+        old_end_date = agreement.end_date
+        old_effective_date = agreement.effective_date
+        old_term_length = agreement.term_length_months
+        
+        # Update fields if provided
+        if 'vendor' in data:
+            agreement.vendor = data['vendor'].strip()
+        
+        if 'effective_date' in data:
+            try:
+                from dateutil import parser as date_parser
+                new_effective_date = date_parser.parse(data['effective_date']).date()
+                if new_effective_date != old_effective_date:
+                    agreement.effective_date = new_effective_date
+                    dates_changed = True
+            except (ValueError, TypeError):
+                return jsonify({'error': 'Invalid effective_date format'}), 400
+        
+        if 'end_date' in data:
+            try:
+                from dateutil import parser as date_parser
+                new_end_date = date_parser.parse(data['end_date']).date()
+                if new_end_date != old_end_date:
+                    agreement.end_date = new_end_date
+                    dates_changed = True
+            except (ValueError, TypeError):
+                return jsonify({'error': 'Invalid end_date format'}), 400
+        
+        if 'term_length_months' in data:
+            try:
+                new_term_length = int(data['term_length_months'])
+                if new_term_length < 1:
+                    return jsonify({'error': 'Term length must be at least 1 month'}), 400
+                if new_term_length != old_term_length:
+                    agreement.term_length_months = new_term_length
+                    dates_changed = True
+            except (ValueError, TypeError):
+                return jsonify({'error': 'Invalid term_length_months'}), 400
+        
+        if 'total_value' in data:
+            try:
+                agreement.total_value = float(data['total_value'])
+                if agreement.total_value < 0:
+                    return jsonify({'error': 'Total value must be non-negative'}), 400
+            except (ValueError, TypeError):
+                return jsonify({'error': 'Invalid total_value'}), 400
+        
+        if 'currency' in data:
+            agreement.currency = data['currency']
+        
+        # Validate that end_date is after effective_date
+        if agreement.effective_date and agreement.end_date:
+            if agreement.end_date <= agreement.effective_date:
+                return jsonify({'error': 'End date must be after effective date'}), 400
+        
+        # Update the updated_at timestamp
+        agreement.updated_at = datetime.utcnow()
+        
+        # If any date-related fields changed, update calendar events
+        if dates_changed:
+            current_app.logger.info(f"Dates changed for agreement {agreement_id}, updating calendar events")
+            if not update_agreement_dates(agreement):
+                return jsonify({'error': 'Failed to update calendar events'}), 500
+        
+        # Commit all changes
+        db.session.commit()
+        
+        return jsonify({
+            'message': f'Successfully updated {agreement.vendor} agreement',
+            'agreement': agreement.to_dict(),
+            'calendar_updated': dates_changed
+        }), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Update agreement error: {str(e)}")
+        return jsonify({'error': 'Failed to update agreement'}), 500
